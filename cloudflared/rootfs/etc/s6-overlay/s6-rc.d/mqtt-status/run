@@ -1,0 +1,179 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant App: Cloudflared
+#
+# Publishes the Cloudflare Tunnel connectivity status to Home Assistant via
+# MQTT. Uses MQTT Discovery so a "Tunnel Connected" sensor appears
+# automatically once an MQTT broker is configured, no manual setup required.
+# ==============================================================================
+
+declare -r device_id="cloudflared"
+declare -r discovery_topic="homeassistant/binary_sensor/${device_id}/tunnel_connected/config"
+declare -r state_topic="cloudflared/tunnel_connected/state"
+declare -r availability_topic="cloudflared/tunnel_connected/availability"
+declare -r metrics_url="http://127.0.0.1:36500/ready"
+declare -r update_interval=30
+declare lwt_holder_pid=""
+
+# ------------------------------------------------------------------------------
+# Publishes a retained message to the configured MQTT broker
+# ------------------------------------------------------------------------------
+mqttPublish() {
+    local topic="$1"
+    local payload="$2"
+    local -a options
+
+    options=(-h "${mqtt_host}" -p "${mqtt_port}" -t "${topic}" -m "${payload}" -r)
+
+    if bashio::var.has_value "${mqtt_username}"; then
+        options+=(-u "${mqtt_username}" -P "${mqtt_password}")
+    fi
+
+    if bashio::var.true "${mqtt_ssl}"; then
+        options+=(--capath /etc/ssl/certs)
+    fi
+
+    mosquitto_pub "${options[@]}" 2>/dev/null ||
+        bashio::log.warning "Failed to publish MQTT message to ${topic}"
+}
+
+# ------------------------------------------------------------------------------
+# Builds the MQTT Discovery config payload for the tunnel connectivity sensor
+# ------------------------------------------------------------------------------
+buildDiscoveryPayload() {
+    local device
+    device=$(bashio::var.json \
+        identifiers "^[\"${device_id}\"]" \
+        name "Cloudflare Tunnel" \
+        manufacturer "Cloudflare" \
+        model "cloudflared")
+
+    bashio::var.json \
+        name "Tunnel Connected" \
+        unique_id "${device_id}_tunnel_connected" \
+        state_topic "${state_topic}" \
+        payload_on "ON" \
+        payload_off "OFF" \
+        device_class "connectivity" \
+        availability_topic "${availability_topic}" \
+        payload_available "online" \
+        payload_not_available "offline" \
+        device "^${device}"
+}
+
+# ------------------------------------------------------------------------------
+# Queries cloudflared's local metrics endpoint and returns the HTTP status
+# code, or an empty string if it could not be reached
+# ------------------------------------------------------------------------------
+fetchMetricsHttpCode() {
+    curl -s -o /dev/null -w '%{http_code}' --max-time 5 "${metrics_url}" || true
+}
+
+# ------------------------------------------------------------------------------
+# Maps a metrics endpoint HTTP status code to a binary_sensor state.
+# cloudflared's /ready endpoint returns 200 once at least one connection to
+# Cloudflare's edge is established, and 503 otherwise
+# ------------------------------------------------------------------------------
+httpCodeToState() {
+    local http_code="$1"
+
+    if [[ "${http_code}" == "200" ]]; then
+        echo "ON"
+    else
+        echo "OFF"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Loads MQTT broker connection details from the Supervisor's MQTT service
+# ------------------------------------------------------------------------------
+loadMqttConnection() {
+    mqtt_host=$(bashio::services 'mqtt' 'host')
+    mqtt_port=$(bashio::services 'mqtt' 'port')
+    mqtt_username=$(bashio::services 'mqtt' 'username')
+    mqtt_password=$(bashio::services 'mqtt' 'password')
+    mqtt_ssl=$(bashio::services 'mqtt' 'ssl')
+}
+
+# ------------------------------------------------------------------------------
+# Holds a persistent MQTT connection with a registered Last Will and
+# Testament, so the broker itself marks the sensor unavailable if this
+# process is killed uncleanly (crash, OOM, host power loss), without relying
+# on it having a chance to publish anything itself. Prints the holder's PID
+# ------------------------------------------------------------------------------
+startAvailabilityLwtHolder() {
+    local -a options
+
+    options=(-h "${mqtt_host}" -p "${mqtt_port}" -t "${availability_topic}" \
+        --will-topic "${availability_topic}" --will-payload "offline" \
+        --will-qos 1 --will-retain)
+
+    if bashio::var.has_value "${mqtt_username}"; then
+        options+=(-u "${mqtt_username}" -P "${mqtt_password}")
+    fi
+
+    if bashio::var.true "${mqtt_ssl}"; then
+        options+=(--capath /etc/ssl/certs)
+    fi
+
+    mosquitto_sub "${options[@]}" >/dev/null 2>&1 &
+    echo "$!"
+}
+
+# ------------------------------------------------------------------------------
+# Marks the sensor unavailable and stops the LWT holder on a clean shutdown.
+# The registered Last Will covers unclean termination (e.g. SIGKILL), this
+# covers the common case of the app being stopped or restarted normally
+# ------------------------------------------------------------------------------
+cleanup() {
+    bashio::log.trace "${FUNCNAME[0]}"
+
+    if bashio::var.has_value "${lwt_holder_pid}"; then
+        kill "${lwt_holder_pid}" 2>/dev/null
+    fi
+
+    mqttPublish "${availability_topic}" "offline"
+    exit 0
+}
+
+# ==============================================================================
+# RUN LOGIC
+# ------------------------------------------------------------------------------
+main() {
+    bashio::log.trace "${FUNCNAME[0]}"
+
+    if ! bashio::config.true 'mqtt_status'; then
+        bashio::log.info "MQTT status reporting is disabled, set 'mqtt_status: true' to enable it"
+        while true; do
+            sleep 3600
+        done
+    fi
+
+    if ! bashio::services.available 'mqtt'; then
+        bashio::log.info "No MQTT service configured, tunnel status will not be published"
+
+        while ! bashio::services.available 'mqtt'; do
+            sleep "${update_interval}"
+        done
+
+        bashio::log.info "MQTT service detected, starting to publish tunnel status"
+    fi
+
+    loadMqttConnection
+    lwt_holder_pid=$(startAvailabilityLwtHolder)
+    trap cleanup EXIT TERM INT
+
+    mqttPublish "${availability_topic}" "online"
+    bashio::log.info "Publishing Cloudflare Tunnel status to Home Assistant via MQTT"
+    mqttPublish "${discovery_topic}" "$(buildDiscoveryPayload)"
+
+    while true; do
+        mqttPublish "${state_topic}" "$(httpCodeToState "$(fetchMetricsHttpCode)")"
+        sleep "${update_interval}"
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

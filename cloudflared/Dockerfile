@@ -7,7 +7,9 @@ ENV S6_VERBOSITY="1"
 ARG BUILD_ARCH="amd64"
 
 # renovate: datasource=repology depName=yq packageName=alpine_3_22/yq-go versioning=loose
-ARG YQ_VERSION="4.53.3-r0"
+ARG YQ_VERSION="4.53.3-r1"
+# renovate: datasource=repology depName=mosquitto-clients packageName=alpine_3_24/mosquitto-clients versioning=loose
+ARG MOSQUITTO_CLIENTS_VERSION="2.1.2-r1"
 # renovate: datasource=github-releases depName=cloudflared packageName=cloudflare/cloudflared versioning=loose
 ARG CLOUDFLARED_VERSION="2026.8.3"
 

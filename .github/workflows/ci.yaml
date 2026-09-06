@@ -126,7 +126,9 @@ jobs:
       - name: ⤵️ Check out code from GitHub
         uses: actions/checkout@v7
       - name: 🚀 Run shell test suite
-        run: bash ./cloudflared/tests/test_config_and_set_vars.sh
+        run: |
+          bash ./cloudflared/tests/test_config_and_set_vars.sh
+          bash ./cloudflared/tests/test_mqtt_status.sh
 
   build:
     name: Build ${{ matrix.architecture }}

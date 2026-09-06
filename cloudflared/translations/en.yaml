@@ -43,5 +43,11 @@ configuration:
     description: >-
       When set all other options will be ignored. Use this option if you set up
       the tunnel with the Cloudflare Dashboard.
+  mqtt_status:
+    name: MQTT Status Reporting
+    description: >-
+      When enabled and an MQTT broker is configured in Home Assistant,
+      publishes a "Tunnel Connected" sensor reflecting whether the Cloudflare
+      Tunnel currently has an active connection.
 network:
   36500/tcp: Metrics Web Interface (36500/tcp)

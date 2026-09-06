@@ -48,11 +48,46 @@ bashio::var.is_empty() {
     [[ -z "${1:-}" ]]
 }
 
+bashio::var.has_value() {
+    [[ -n "${1:-}" ]]
+}
+
 bashio::var.true() {
     case "${1:-}" in
         true|1|TRUE|yes|YES) return 0;;
         *) return 1;;
     esac
+}
+
+# Faithful re-implementation of bashio's JSON helpers (they only depend on jq,
+# not on the Supervisor API, so there is no need to stub them out).
+bashio::var.json_string() {
+    printf '%s' "${1}" | jq -Rs .
+}
+
+bashio::var.json() {
+    local data=("$@")
+    local json=''
+    local separator
+    local counter=0
+    local item
+
+    for i in "${data[@]}"; do
+        separator=","
+        if [ $((++counter % 2)) -eq 0 ]; then
+            separator=":"
+            if [[ "${i:0:1}" == "^" ]]; then
+                item="${i:1}"
+            else
+                item=$(bashio::var.json_string "${i}")
+            fi
+        else
+            item=$(bashio::var.json_string "${i}")
+        fi
+        json="$json$separator$item"
+    done
+
+    echo "{${json:1}}"
 }
 
 bashio::exit.nok() {
