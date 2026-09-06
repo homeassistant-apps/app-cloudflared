@@ -8,7 +8,8 @@
 set -eux
 
 # yq is to avoid depending on Home Assistant API on startup
-apk add --no-cache yq-go="${YQ_VERSION}"
+# mosquitto-clients provides mosquitto_pub, used to report tunnel status via MQTT
+apk add --no-cache yq-go="${YQ_VERSION}" mosquitto-clients="${MOSQUITTO_CLIENTS_VERSION}"
 
 # Adapt the architecture to the cloudflared specific names if needed
 case "${BUILD_ARCH}" in

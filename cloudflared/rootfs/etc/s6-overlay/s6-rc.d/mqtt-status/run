@@ -1,0 +1,350 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant App: Cloudflared
+#
+# Publishes Cloudflare Tunnel status to Home Assistant via MQTT: whether it is
+# connected, how many active connections it has, proxied request/error
+# counts, and which Cloudflare edge locations it is connected to. Uses MQTT
+# Discovery so the entities appear automatically once an MQTT broker is
+# configured, no manual setup required.
+# ==============================================================================
+
+declare -r device_id="cloudflared"
+
+declare -r discovery_topic="homeassistant/binary_sensor/${device_id}/tunnel_connected/config"
+declare -r state_topic="cloudflared/tunnel_connected/state"
+declare -r availability_topic="cloudflared/tunnel_connected/availability"
+declare -r attributes_topic="cloudflared/tunnel_connected/attributes"
+
+declare -r active_connections_discovery_topic="homeassistant/sensor/${device_id}/active_connections/config"
+declare -r active_connections_topic="cloudflared/active_connections/state"
+
+declare -r total_requests_discovery_topic="homeassistant/sensor/${device_id}/total_requests/config"
+declare -r total_requests_topic="cloudflared/total_requests/state"
+
+declare -r request_errors_discovery_topic="homeassistant/sensor/${device_id}/request_errors/config"
+declare -r request_errors_topic="cloudflared/request_errors/state"
+
+declare -r ready_url="http://127.0.0.1:36500/ready"
+declare -r metrics_url="http://127.0.0.1:36500/metrics"
+declare -r update_interval=30
+declare lwt_holder_pid=""
+
+# ------------------------------------------------------------------------------
+# Publishes a retained message to the configured MQTT broker
+# ------------------------------------------------------------------------------
+mqttPublish() {
+    local topic="$1"
+    local payload="$2"
+    local -a options
+
+    options=(-h "${mqtt_host}" -p "${mqtt_port}" -t "${topic}" -m "${payload}" -r)
+
+    if bashio::var.has_value "${mqtt_username}"; then
+        options+=(-u "${mqtt_username}" -P "${mqtt_password}")
+    fi
+
+    if bashio::var.true "${mqtt_ssl}"; then
+        options+=(--capath /etc/ssl/certs)
+    fi
+
+    mosquitto_pub "${options[@]}" 2>/dev/null ||
+        bashio::log.warning "Failed to publish MQTT message to ${topic}"
+}
+
+# ------------------------------------------------------------------------------
+# Builds the shared "Cloudflare Tunnel" device object referenced by every
+# entity's discovery payload, so they all group under one device in HA
+# ------------------------------------------------------------------------------
+buildDeviceJson() {
+    bashio::var.json \
+        identifiers "^[\"${device_id}\"]" \
+        name "Cloudflare Tunnel" \
+        manufacturer "Cloudflare" \
+        model "cloudflared"
+}
+
+# ------------------------------------------------------------------------------
+# Builds the MQTT Discovery config payload for the tunnel connectivity sensor
+# ------------------------------------------------------------------------------
+buildDiscoveryPayload() {
+    local device
+    device=$(buildDeviceJson)
+
+    local -a fields=(
+        name "Tunnel Connected"
+        unique_id "${device_id}_tunnel_connected"
+        state_topic "${state_topic}"
+        payload_on "ON"
+        payload_off "OFF"
+        device_class "connectivity"
+        availability_topic "${availability_topic}"
+        payload_available "online"
+        payload_not_available "offline"
+        device "^${device}"
+    )
+
+    if bashio::config.true 'mqtt_extra_stats'; then
+        fields+=(json_attributes_topic "${attributes_topic}")
+    fi
+
+    bashio::var.json "${fields[@]}"
+}
+
+# ------------------------------------------------------------------------------
+# Builds the MQTT Discovery config payload for a diagnostic sensor sharing
+# the Cloudflare Tunnel device and its availability
+# ------------------------------------------------------------------------------
+buildSensorDiscoveryPayload() {
+    local name="$1"
+    local object_id="$2"
+    local sensor_state_topic="$3"
+    local unit="$4"
+    local state_class="$5"
+    local icon="$6"
+    local device
+    device=$(buildDeviceJson)
+
+    bashio::var.json \
+        name "${name}" \
+        unique_id "${device_id}_${object_id}" \
+        state_topic "${sensor_state_topic}" \
+        unit_of_measurement "${unit}" \
+        state_class "${state_class}" \
+        icon "${icon}" \
+        entity_category "diagnostic" \
+        availability_topic "${availability_topic}" \
+        payload_available "online" \
+        payload_not_available "offline" \
+        device "^${device}"
+}
+
+# ------------------------------------------------------------------------------
+# Builds the JSON attributes payload listing which Cloudflare edge locations
+# the tunnel is currently connected to, one entry per active connection
+# ------------------------------------------------------------------------------
+buildAttributesPayload() {
+    local -a locations=("$@")
+    local locations_json
+    locations_json=$(bashio::var.json_array "${locations[@]}")
+
+    bashio::var.json edge_locations "^${locations_json}"
+}
+
+# ------------------------------------------------------------------------------
+# Queries cloudflared's local readiness endpoint, which reports connection
+# state as JSON: {"status":200,"readyConnections":4,"connectorId":"..."}
+# ------------------------------------------------------------------------------
+fetchReadyJson() {
+    curl -s --max-time 5 "${ready_url}" || true
+}
+
+# ------------------------------------------------------------------------------
+# Extracts the number of active edge connections from a /ready JSON response,
+# defaulting to 0 if it is missing, malformed, or unreachable
+# ------------------------------------------------------------------------------
+readyConnectionsFromJson() {
+    local json="$1"
+
+    if bashio::var.is_empty "${json}"; then
+        echo 0
+        return
+    fi
+
+    bashio::jq "${json}" '.readyConnections // 0' 2>/dev/null || echo 0
+}
+
+# ------------------------------------------------------------------------------
+# Maps a /ready JSON response to a binary_sensor state: "ON" once at least
+# one connection to Cloudflare's edge is ready, "OFF" otherwise
+# ------------------------------------------------------------------------------
+stateFromReadyJson() {
+    local json="$1"
+    local ready_connections
+    ready_connections=$(readyConnectionsFromJson "${json}")
+
+    if [[ "${ready_connections}" -gt 0 ]] 2>/dev/null; then
+        echo "ON"
+    else
+        echo "OFF"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Queries cloudflared's Prometheus metrics endpoint as raw text
+# ------------------------------------------------------------------------------
+fetchMetricsText() {
+    curl -s --max-time 5 "${metrics_url}" || true
+}
+
+# ------------------------------------------------------------------------------
+# Extracts the value of an unlabeled Prometheus counter/gauge line (e.g.
+# "cloudflared_tunnel_total_requests 42") from metrics text
+# ------------------------------------------------------------------------------
+extractMetricsCounter() {
+    local metrics_text="$1"
+    local metric_name="$2"
+
+    echo "${metrics_text}" | awk -v name="${metric_name}" '$1==name {print $2}'
+}
+
+# ------------------------------------------------------------------------------
+# Extracts the Cloudflare edge locations the tunnel is currently connected
+# to from cloudflared_tunnel_server_locations{connection_id="0",
+# edge_location="sjc08"} 1 lines. A value of 1 means the current location for
+# that connection, 0 means a location it has since moved away from
+# ------------------------------------------------------------------------------
+extractEdgeLocations() {
+    local metrics_text="$1"
+
+    echo "${metrics_text}" | awk -F'"' \
+        '/^cloudflared_tunnel_server_locations\{/ { n=split($0,parts," "); if (parts[n]=="1") print $4 }'
+}
+
+# ------------------------------------------------------------------------------
+# Loads MQTT broker connection details from the Supervisor's MQTT service
+# ------------------------------------------------------------------------------
+loadMqttConnection() {
+    mqtt_host=$(bashio::services 'mqtt' 'host')
+    mqtt_port=$(bashio::services 'mqtt' 'port')
+    mqtt_username=$(bashio::services 'mqtt' 'username')
+    mqtt_password=$(bashio::services 'mqtt' 'password')
+    mqtt_ssl=$(bashio::services 'mqtt' 'ssl')
+}
+
+# ------------------------------------------------------------------------------
+# Holds a persistent MQTT connection with a registered Last Will and
+# Testament, so the broker itself marks the sensors unavailable if this
+# process is killed uncleanly (crash, OOM, host power loss), without relying
+# on it having a chance to publish anything itself. Prints the holder's PID
+# ------------------------------------------------------------------------------
+startAvailabilityLwtHolder() {
+    local -a options
+
+    options=(-h "${mqtt_host}" -p "${mqtt_port}" -t "${availability_topic}" \
+        --will-topic "${availability_topic}" --will-payload "offline" \
+        --will-qos 1 --will-retain)
+
+    if bashio::var.has_value "${mqtt_username}"; then
+        options+=(-u "${mqtt_username}" -P "${mqtt_password}")
+    fi
+
+    if bashio::var.true "${mqtt_ssl}"; then
+        options+=(--capath /etc/ssl/certs)
+    fi
+
+    mosquitto_sub "${options[@]}" >/dev/null 2>&1 &
+    echo "$!"
+}
+
+# ------------------------------------------------------------------------------
+# Marks the sensors unavailable and stops the LWT holder on a clean shutdown.
+# The registered Last Will covers unclean termination (e.g. SIGKILL), this
+# covers the common case of the app being stopped or restarted normally
+# ------------------------------------------------------------------------------
+cleanup() {
+    bashio::log.trace "${FUNCNAME[0]}"
+
+    if bashio::var.has_value "${lwt_holder_pid}"; then
+        kill "${lwt_holder_pid}" 2>/dev/null
+    fi
+
+    mqttPublish "${availability_topic}" "offline"
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# Publishes the MQTT Discovery config for every entity once. The extra
+# diagnostic sensors are only published when 'mqtt_extra_stats' is enabled,
+# so 'mqtt_status' alone just gives the base connectivity sensor
+# ------------------------------------------------------------------------------
+publishDiscoveryConfigs() {
+    mqttPublish "${discovery_topic}" "$(buildDiscoveryPayload)"
+
+    if ! bashio::config.true 'mqtt_extra_stats'; then
+        return
+    fi
+
+    mqttPublish "${active_connections_discovery_topic}" \
+        "$(buildSensorDiscoveryPayload "Active Connections" "active_connections" "${active_connections_topic}" "connections" "measurement" "mdi:connection")"
+    mqttPublish "${total_requests_discovery_topic}" \
+        "$(buildSensorDiscoveryPayload "Total Requests" "total_requests" "${total_requests_topic}" "requests" "total_increasing" "mdi:web")"
+    mqttPublish "${request_errors_discovery_topic}" \
+        "$(buildSensorDiscoveryPayload "Request Errors" "request_errors" "${request_errors_topic}" "errors" "total_increasing" "mdi:alert-circle-outline")"
+}
+
+# ------------------------------------------------------------------------------
+# Fetches current tunnel status and publishes it to every entity's state
+# topic. Missing/unreachable metrics are skipped for this cycle rather than
+# overwriting the last known good, retained value. The extra diagnostic
+# sensors and edge_locations attribute are only published when
+# 'mqtt_extra_stats' is enabled
+# ------------------------------------------------------------------------------
+publishTunnelStatus() {
+    local ready_json
+    ready_json=$(fetchReadyJson)
+
+    mqttPublish "${state_topic}" "$(stateFromReadyJson "${ready_json}")"
+
+    if ! bashio::config.true 'mqtt_extra_stats'; then
+        return
+    fi
+
+    mqttPublish "${active_connections_topic}" "$(readyConnectionsFromJson "${ready_json}")"
+
+    local metrics_text
+    metrics_text=$(fetchMetricsText)
+
+    local total_requests request_errors
+    total_requests=$(extractMetricsCounter "${metrics_text}" "cloudflared_tunnel_total_requests")
+    request_errors=$(extractMetricsCounter "${metrics_text}" "cloudflared_tunnel_request_errors")
+
+    bashio::var.has_value "${total_requests}" && mqttPublish "${total_requests_topic}" "${total_requests}"
+    bashio::var.has_value "${request_errors}" && mqttPublish "${request_errors_topic}" "${request_errors}"
+
+    local -a locations
+    mapfile -t locations < <(extractEdgeLocations "${metrics_text}")
+    mqttPublish "${attributes_topic}" "$(buildAttributesPayload "${locations[@]}")"
+}
+
+# ==============================================================================
+# RUN LOGIC
+# ------------------------------------------------------------------------------
+main() {
+    bashio::log.trace "${FUNCNAME[0]}"
+
+    if ! bashio::config.true 'mqtt_status'; then
+        bashio::log.info "MQTT status reporting is disabled, set 'mqtt_status: true' to enable it"
+        while true; do
+            sleep 3600
+        done
+    fi
+
+    if ! bashio::services.available 'mqtt'; then
+        bashio::log.info "No MQTT service configured, tunnel status will not be published"
+
+        while ! bashio::services.available 'mqtt'; do
+            sleep "${update_interval}"
+        done
+
+        bashio::log.info "MQTT service detected, starting to publish tunnel status"
+    fi
+
+    loadMqttConnection
+    lwt_holder_pid=$(startAvailabilityLwtHolder)
+    trap cleanup EXIT TERM INT
+
+    mqttPublish "${availability_topic}" "online"
+    bashio::log.info "Publishing Cloudflare Tunnel status to Home Assistant via MQTT"
+    publishDiscoveryConfigs
+
+    while true; do
+        publishTunnelStatus
+        sleep "${update_interval}"
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

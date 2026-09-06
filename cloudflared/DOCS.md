@@ -82,6 +82,8 @@ advanced config can be achieved using the remote tunnel setup.
 - [`post_quantum`](#option-post_quantum)
 - [`run_parameters`](#option-run_parameters)
 - [`log_level`](#option-log_level)
+- [`mqtt_status`](#option-mqtt_status)
+- [`mqtt_extra_stats`](#option-mqtt_extra_stats)
 
 ### Overview: App configuration
 
@@ -315,6 +317,48 @@ after attempting to connect to find the correct IP.**
 
 Remember to restart Home Assistant after those changes.
 
+### Option: `mqtt_status`
+
+If you have an MQTT broker configured in Home Assistant (for example via the
+[Mosquitto broker][mosquitto-broker] app), set `mqtt_status` to `true` to have
+Cloudflared publish a **Tunnel Connected** binary sensor via
+[MQTT Discovery][mqtt-discovery], checked every 30 seconds via cloudflared's
+local metrics endpoint. The entity appears on its own once enabled, no
+further setup required.
+
+```yaml
+mqtt_status: true
+```
+
+Disabled by default. If enabled without an MQTT broker configured, this
+feature is silently skipped.
+
+If the app is stopped, restarted, or crashes, the entity is marked
+**unavailable** in Home Assistant rather than showing a stale value, using
+MQTT's Last Will and Testament mechanism.
+
+### Option: `mqtt_extra_stats`
+
+Requires `mqtt_status` to also be enabled. Adds three more entities to the
+same **Cloudflare Tunnel** device:
+
+```yaml
+mqtt_status: true
+mqtt_extra_stats: true
+```
+
+- **Active Connections** (sensor): number of currently active edge
+  connections (0-4).
+- **Total Requests** / **Request Errors** (sensors): cumulative count of
+  requests proxied through the tunnel, and how many of those failed reaching
+  the origin.
+
+The **Tunnel Connected** sensor also gains an `edge_locations` attribute
+listing which Cloudflare datacenters (e.g. `sjc08`, `lax11`) each active
+connection is currently using.
+
+Disabled by default.
+
 ## App Wiki
 
 For more advance [How-Tos][how-tos] and a [Troubleshooting Section][troubleshooting],
@@ -370,3 +414,5 @@ SOFTWARE.
 [disablechunkedencoding]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/configuration-file/ingress#disablechunkedencoding
 [create-remote-managed-tunnel]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/#1-create-a-tunnel
 [github-org]: https://github.com/homeassistant-apps
+[mosquitto-broker]: https://github.com/home-assistant/addons/tree/master/mosquitto
+[mqtt-discovery]: https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery
