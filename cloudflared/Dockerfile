@@ -1,4 +1,4 @@
-FROM ghcr.io/hassio-addons/base:21.0.4
+FROM ghcr.io/hassio-addons/base:21.0.5
 
 # Set S6 verbosity level
 ENV S6_VERBOSITY="1"
