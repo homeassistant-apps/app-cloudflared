@@ -9,7 +9,7 @@ ARG BUILD_ARCH="amd64"
 # renovate: datasource=repology depName=yq packageName=alpine_3_22/yq-go versioning=loose
 ARG YQ_VERSION="4.53.3-r1"
 # renovate: datasource=github-releases depName=cloudflared packageName=cloudflare/cloudflared versioning=loose
-ARG CLOUDFLARED_VERSION="2026.9.0"
+ARG CLOUDFLARED_VERSION="2026.9.1"
 
 # Copy root filesystem
 COPY rootfs /
