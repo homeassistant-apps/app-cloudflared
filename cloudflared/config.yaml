@@ -11,6 +11,8 @@ url: "https://github.com/homeassistant-apps/app-cloudflared"
 startup: services
 init: false
 hassio_api: true
+discovery:
+  - cloudflare_tunnel_monitor
 arch:
   - aarch64
   - amd64
