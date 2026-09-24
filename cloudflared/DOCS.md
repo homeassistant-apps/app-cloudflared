@@ -315,6 +315,101 @@ after attempting to connect to find the correct IP.**
 
 Remember to restart Home Assistant after those changes.
 
+## Metrics endpoint
+
+Cloudflared exposes a small HTTP API on port `36500` (the `Metrics Web Interface`
+shown in the app's Network settings). You can use this to build your own
+sensors in Home Assistant, without needing any app configuration.
+
+To reach it from other apps, or from Home Assistant itself, use the app's
+internal hostname (shown on its **Info** page, e.g. `<hash>-cloudflared`)
+and port `36500`, for example `http://<app-hostname>:36500/ready`. To
+reach it from outside the internal Docker network (e.g. to test with
+`curl` from your own machine), map `36500/tcp` to a host port in the
+app's **Network** settings first.
+
+**Note**: _This endpoint is not authenticated. Anything with network access
+to the app can read it._
+
+### Auto-discovery for companion integrations
+
+This app also announces its metrics endpoint via Home Assistant's built-in
+Supervisor Discovery mechanism on startup. Only the `cloudflare_tunnel_monitor`
+integration domain currently listens for this. If you have it installed, it
+can pick up the metrics URL automatically, without you having to look up
+the app's hostname or type anything in by hand.
+
+This is a one-way announcement: the app doesn't know or care whether
+anything is listening for it, so there is nothing to configure here
+either way.
+
+### `/ready`
+
+Returns a small JSON object describing whether the tunnel currently has an
+active connection to Cloudflare's edge:
+
+```json
+{ "status": 200, "readyConnections": 4, "connectorId": "..." }
+```
+
+`readyConnections` is `0` when disconnected. This is the cheapest way to
+build a "is my tunnel up" sensor.
+
+### `/metrics`
+
+Returns cloudflared's full [Prometheus metrics][cloudflared-metrics] output.
+This has tons of data. If you're parsing it yourself for a minimal setup,
+these four are the simplest starting point:
+
+- `cloudflared_tunnel_total_requests`: total requests proxied through the tunnel
+- `cloudflared_tunnel_request_errors`: count of failed requests reaching
+  your origin
+- `cloudflared_tunnel_ha_connections`: number of active edge connections
+- `cloudflared_tunnel_server_locations`: which Cloudflare edge datacenter
+  each active connection uses, e.g.
+  `{connection_id="0",edge_location="sjc08"} 1`. A value of `1` means the
+  current location for that connection, `0` means a location it has since
+  moved away from
+
+There's a much larger set of genuinely useful metrics beyond these four
+(QUIC RTT, throughput, congestion window, GC pauses, process health, and
+more) and parsing all of that yourself is a lot of work, which is exactly
+what the integration below already does.
+
+### Turning this into sensors
+
+**Recommended**: [Cloudflare Tunnel Monitor][cloudflare-tunnel-monitor] is
+a custom integration that reads this metrics endpoint and creates the
+sensors for you, including tunnel status, active connections, and ~50
+metrics covering QUIC RTT, throughput, latency, and process health. If
+it's installed, it will pick this app up automatically via
+[auto-discovery](#auto-discovery-for-companion-integrations), no
+configuration needed.
+
+**Disclosure**: The integration shown here is a fork of
+[deadbeef3137/ha-cloudflare-tunnel-monitor][cloudflare-tunnel-monitor-upstream]
+adding local-only setup, no Cloudflare API token needed, just this
+metrics endpoint.
+
+**Prefer to do it yourself?** You can build the same basic sensors
+directly with a `rest` sensor, no extra integration required. Add to
+your `configuration.yaml` (adjust the hostname/IP to match your
+network), then restart Home Assistant:
+
+```yaml
+rest:
+  - resource: http://<app-hostname-or-ip>:36500/ready
+    scan_interval: 30
+    sensor:
+      - name: "Cloudflare Tunnel Connected"
+        value_template: >-
+          {{ 'Connected' if value_json.status == 200 else 'Disconnected' }}
+      - name: "Cloudflare Tunnel Active Connections"
+        value_template: "{{ value_json.readyConnections }}"
+        unit_of_measurement: "connections"
+        state_class: measurement
+```
+
 ## App Wiki
 
 For more advance [How-Tos][how-tos] and a [Troubleshooting Section][troubleshooting],
@@ -370,3 +465,6 @@ SOFTWARE.
 [disablechunkedencoding]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/configuration/configuration-file/ingress#disablechunkedencoding
 [create-remote-managed-tunnel]: https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/#1-create-a-tunnel
 [github-org]: https://github.com/homeassistant-apps
+[cloudflare-tunnel-monitor]: https://github.com/vemboy200/ha-cloudflare-tunnel-monitor
+[cloudflare-tunnel-monitor-upstream]: https://github.com/deadbeef3137/ha-cloudflare-tunnel-monitor
+[cloudflared-metrics]: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/monitor-tunnels/metrics/
