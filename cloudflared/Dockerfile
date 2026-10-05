@@ -1,4 +1,4 @@
-FROM ghcr.io/hassio-addons/base:21.0.4
+FROM ghcr.io/hassio-addons/base:21.0.7
 
 # Set S6 verbosity level
 ENV S6_VERBOSITY="1"
@@ -9,7 +9,7 @@ ARG BUILD_ARCH="amd64"
 # renovate: datasource=repology depName=yq packageName=alpine_3_22/yq-go versioning=loose
 ARG YQ_VERSION="4.53.3-r1"
 # renovate: datasource=github-releases depName=cloudflared packageName=cloudflare/cloudflared versioning=loose
-ARG CLOUDFLARED_VERSION="2026.8.3"
+ARG CLOUDFLARED_VERSION="2026.9.3"
 
 # Copy root filesystem
 COPY rootfs /
