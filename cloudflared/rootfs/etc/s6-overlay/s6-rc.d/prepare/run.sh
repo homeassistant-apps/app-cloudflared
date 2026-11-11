@@ -276,7 +276,7 @@ createCertificate() {
     bashio::log.notice
     bashio::log.notice "Please follow the Cloudflare Auth-Steps:"
     bashio::log.notice
-    cloudflared tunnel login
+    cloudflared tunnel login || bashio::exit.nok "Cloudflare authentication failed"
 
     bashio::log.info "Authentication successfull, moving auth file to the '${data_path}' folder"
 
@@ -421,28 +421,88 @@ createConfig() {
 }
 
 # ------------------------------------------------------------------------------
+# Read the actual DNS hostname from cloudflared's JSON success log.
+# The API may append the certificate's zone to a hostname from another domain.
+# ------------------------------------------------------------------------------
+validateDNSRoute() {
+    local hostname="$1"
+    local routed_hostname
+
+    if ! routed_hostname=$(jq -Rers '
+        [split("\n")[] | fromjson? | .message? // empty |
+            capture("^(?:Added CNAME )?(?<hostname>[^ ]+) (?:which will route to this tunnel|updated to route to your tunnel|is already configured to route to your tunnel)$").hostname] |
+        if length == 1 then .[0] else error("Expected one DNS route result") end
+    '); then
+        bashio::log.error "Could not verify the DNS entry for ${hostname}."
+        return 1
+    fi
+
+    if [[ "${routed_hostname}" != "${hostname}" ]]; then
+        bashio::log.warning "Cloudflare routed ${routed_hostname} instead of ${hostname}. The saved certificate authorizes a different DNS zone."
+        bashio::log.warning "Remove the unintended DNS record ${routed_hostname} from Cloudflare."
+        return 2
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Create a DNS route and verify that Cloudflare used the requested hostname.
+# Return 2 for a zone mismatch so the caller can request fresh authorization.
+# ------------------------------------------------------------------------------
+createDNSRoute() {
+    local hostname="$1"
+    local output
+
+    bashio::log.info "Creating DNS entry ${hostname}..."
+    # Force info-level JSON for this command so the result is available even when
+    # the user configured a higher log level for the tunnel itself.
+    if ! output=$(runWithRetry 4 2 "create DNS entry for ${hostname}" \
+        cloudflared --origincert="${data_path}/cert.pem" tunnel --loglevel info --logformat json \
+        route dns -f "${tunnel_uuid}" "${hostname}" 2>&1); then
+        printf '%s\n' "${output}"
+        return 1
+    fi
+    printf '%s\n' "${output}"
+
+    printf '%s\n' "${output}" | validateDNSRoute "${hostname}"
+}
+
+# ------------------------------------------------------------------------------
 # Create cloudflare DNS entry for external hostname and additional hosts
 # ------------------------------------------------------------------------------
 createDNS() {
     bashio::log.trace "${FUNCNAME[0]}"
 
-    # Create DNS entry for external hostname of Home Assistant if 'external_hostname' is set
+    local hostnames=()
     if bashio::var.has_value "${external_hostname}"; then
-        bashio::log.info "Creating DNS entry ${external_hostname}..."
-        runWithRetry 4 2 "create DNS entry for ${external_hostname}" \
-            cloudflared --origincert="${data_path}/cert.pem" tunnel --loglevel "${CLOUDFLARED_LOG}" route dns -f "${tunnel_uuid}" "${external_hostname}" ||
-            bashio::exit.nok "Failed to create DNS entry ${external_hostname}."
+        hostnames+=("${external_hostname}")
     fi
 
-    # Check for configured additional hosts and create DNS entries for them if existing
     local additional_host
-    local hostname
     for additional_host in "${additional_hosts[@]}"; do
-        hostname=$(bashio::jq "${additional_host}" ".hostname")
-        bashio::log.info "Creating DNS entry ${hostname}..."
-        runWithRetry 4 2 "create DNS entry for ${hostname}" \
-            cloudflared --origincert="${data_path}/cert.pem" tunnel --loglevel "${CLOUDFLARED_LOG}" route dns -f "${tunnel_uuid}" "${hostname}" ||
+        hostnames+=("$(bashio::jq "${additional_host}" ".hostname")")
+    done
+
+    local hostname
+    local status
+    local reauthenticated=false
+    for hostname in "${hostnames[@]}"; do
+        if createDNSRoute "${hostname}"; then
+            continue
+        else
+            status=$?
+        fi
+
+        if [[ "${status}" != 2 ]]; then
             bashio::exit.nok "Failed to create DNS entry ${hostname}."
+        fi
+        if [[ "${reauthenticated}" == true ]]; then
+            bashio::exit.nok "DNS zone still does not match ${hostname}. All locally managed hostnames must use the authorized zone. Use a remotely managed tunnel for multiple domains."
+        fi
+
+        bashio::log.notice "Please authorize the domain for ${hostname} using the login link below. The existing tunnel will be kept."
+        createCertificate
+        reauthenticated=true
+        createDNSRoute "${hostname}" || bashio::exit.nok "Failed to create DNS entry ${hostname} after authentication. Select the domain matching ${hostname}, or use a remotely managed tunnel for multiple domains."
     done
 }
 

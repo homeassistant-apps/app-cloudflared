@@ -112,6 +112,23 @@ services.
 external_hostname: ha.example.com
 ```
 
+#### Changing domains
+
+When changing `external_hostname` to a different domain, save the configuration
+and restart the app. The saved Cloudflare certificate is associated with the DNS
+zone selected during the original login. If Cloudflare appends the old domain to
+the new hostname, the app detects the mismatch and displays a new login link in
+the logs. Open that link and select the **new domain** to authorize it. The app
+keeps the existing tunnel and retries the DNS setup after authentication.
+
+Cloudflare may already have created a record under the old domain before
+reporting the mismatch. Remove that unintended record from the old domain's DNS
+settings; its full name is shown in the logs.
+
+All `external_hostname` and `additional_hosts` entries in a locally managed tunnel
+must belong to the authorized DNS zone. To use multiple domains, configure a
+[remotely managed tunnel][app-remote-tunnel] instead.
+
 ### Option: `additional_hosts`
 
 You can use the internal reverse proxy of Cloudflare Tunnel to define additional
